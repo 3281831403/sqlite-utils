@@ -305,7 +305,8 @@ See :ref:`cli_inserting_data`, :ref:`cli_insert_csv_tsv`, :ref:`cli_insert_unstr
       --sniff                   Detect delimiter and quote character
       --no-headers              CSV file has no header row
       --encoding TEXT           Character encoding for input, defaults to utf-8
-      --batch-size INTEGER      Commit every X records
+      --batch-size INTEGER      Commit every X records (default: a single all-or-
+                                nothing transaction)
       --stop-after INTEGER      Stop after X records
       --alter                   Alter existing table to add any missing columns
       --not-null TEXT           Columns that should be created as NOT NULL
@@ -369,7 +370,8 @@ See :ref:`cli_upsert`.
       --sniff                   Detect delimiter and quote character
       --no-headers              CSV file has no header row
       --encoding TEXT           Character encoding for input, defaults to utf-8
-      --batch-size INTEGER      Commit every X records
+      --batch-size INTEGER      Commit every X records (default: a single all-or-
+                                nothing transaction)
       --stop-after INTEGER      Stop after X records
       --alter                   Alter existing table to add any missing columns
       --not-null TEXT           Columns that should be created as NOT NULL
@@ -406,7 +408,8 @@ See :ref:`cli_bulk`.
           ' -
 
     Options:
-      --batch-size INTEGER   Commit every X records
+      --batch-size INTEGER   Commit every X records (default: a single all-or-
+                             nothing transaction)
       --functions TEXT       Python code or a file path defining custom SQL
                              functions; can be used multiple times
       --flatten              Flatten nested JSON objects, so {"a": {"b": 1}} becomes

@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import csv as csv_std
 import difflib
 import hashlib
@@ -1003,7 +1004,10 @@ def insert_upsert_options(*, require_pk=False):
             + _import_options
             + (
                 click.option(
-                    "--batch-size", type=int, default=100, help="Commit every X records"
+                    "--batch-size",
+                    type=int,
+                    default=None,
+                    help="Commit every X records (default: a single all-or-nothing transaction)",
                 ),
                 click.option("--stop-after", type=int, help="Stop after X records"),
                 click.option(
@@ -1118,6 +1122,9 @@ def insert_upsert_implementation(
             extra_kwargs["columns"] = column_type_overrides
         if upsert:
             extra_kwargs["upsert"] = upsert
+        if batch_size is not None:
+            # Explicit --batch-size: each batch commits separately
+            extra_kwargs["batch_size"] = batch_size
 
         # docs should all be dictionaries
         docs = (verify_is_dict(doc) for doc in docs)
@@ -1139,44 +1146,70 @@ def insert_upsert_implementation(
         # table_names() rather than db.table(), which raises NoTable for
         # views before the error handling below can deal with them
         table_existed_before_insert = table in db.table_names()
-        try:
-            db.table(table).insert_all(
-                docs, pk=pk, batch_size=batch_size, alter=alter, **extra_kwargs
-            )
-        except (NoTable, InvalidColumns, PrimaryKeyRequired) as e:
-            raise click.ClickException(str(e))
-        except Exception as e:
-            if (
-                isinstance(e, OperationalError)
-                and e.args
-                and (
-                    "has no column named" in e.args[0] or "no such column" in e.args[0]
-                )
-            ):
-                raise click.ClickException(
-                    f"{e.args[0]}\n\nTry using --alter to add additional columns"
-                )
-            # If we can find sql= and parameters= arguments, show those
-            variables = _find_variables(e.__traceback__, ["sql", "parameters"])
-            if "sql" in variables and "parameters" in variables:
-                raise click.ClickException(
-                    "{}\n\nsql = {}\nparameters = {}".format(
-                        str(e), variables["sql"], variables["parameters"]
+        columns_before_insert = (
+            {column.name for column in db.table(table).columns}
+            if table_existed_before_insert
+            else set()
+        )
+        # Without an explicit --batch-size the insert and any type
+        # transforms run in a single transaction, so a failure part-way
+        # through leaves the database untouched
+        transaction = (
+            contextlib.nullcontext() if batch_size is not None else db.atomic()
+        )
+        with transaction:
+            try:
+                db.table(table).insert_all(docs, pk=pk, alter=alter, **extra_kwargs)
+            except (NoTable, InvalidColumns, PrimaryKeyRequired) as e:
+                raise click.ClickException(str(e))
+            except Exception as e:
+                if (
+                    isinstance(e, OperationalError)
+                    and e.args
+                    and (
+                        "has no column named" in e.args[0]
+                        or "no such column" in e.args[0]
                     )
-                )
-            else:
-                raise
-        # Apply detected types only to a table this command created -
-        # transforming a pre-existing table would rewrite its column types
-        # and corrupt values such as TEXT zip codes with leading zeros
-        if (
-            tracker is not None
-            and not table_existed_before_insert
-            and db.table(table).exists()
-        ):
-            detected_types = tracker.types
-            detected_types.update(column_type_overrides)
-            db.table(table).transform(types=detected_types)
+                ):
+                    raise click.ClickException(
+                        f"{e.args[0]}\n\nTry using --alter to add additional columns"
+                    )
+                # If we can find sql= and parameters= arguments, show those
+                variables = _find_variables(e.__traceback__, ["sql", "parameters"])
+                if "sql" in variables and "parameters" in variables:
+                    raise click.ClickException(
+                        "{}\n\nsql = {}\nparameters = {}".format(
+                            str(e), variables["sql"], variables["parameters"]
+                        )
+                    )
+                else:
+                    raise
+            if not table_existed_before_insert:
+                # Apply detected types only to a table this command created -
+                # transforming a pre-existing table would rewrite its column types
+                # and corrupt values such as TEXT zip codes with leading zeros
+                if tracker is not None and db.table(table).exists():
+                    detected_types = tracker.types
+                    detected_types.update(column_type_overrides)
+                    db.table(table).transform(types=detected_types)
+            elif db.table(table).exists():
+                # Incremental (--alter) import into a pre-existing table:
+                # apply detected and explicitly requested types to the
+                # columns this command added, so an incremental import
+                # produces the same column types as a one-shot import.
+                # Columns that already existed are never rewritten.
+                tracked_types = tracker.types if tracker is not None else {}
+                new_column_types = {}
+                for column in db.table(table).columns:
+                    if column.name in columns_before_insert:
+                        continue
+                    column_type = column_type_overrides.get(
+                        column.name
+                    ) or tracked_types.get(column.name)
+                    if column_type:
+                        new_column_types[column.name] = column_type
+                if new_column_types:
+                    db.table(table).transform(types=new_column_types)
 
     if code is not None:
         if file is not None:
@@ -1584,7 +1617,12 @@ def upsert(
 )
 @click.argument("sql")
 @click.argument("file", type=click.File("rb"), required=True)
-@click.option("--batch-size", type=int, default=100, help="Commit every X records")
+@click.option(
+    "--batch-size",
+    type=int,
+    default=None,
+    help="Commit every X records (default: a single all-or-nothing transaction)",
+)
 @functions_option
 @import_options
 @load_extension_option

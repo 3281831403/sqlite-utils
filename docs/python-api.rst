@@ -1092,7 +1092,7 @@ Use it like this:
 
 The column types used in the ``CREATE TABLE`` statement are automatically derived from the types of data in that first batch of rows. Any additional columns in subsequent batches will cause a ``sqlite3.OperationalError`` exception to be raised unless the ``alter=True`` argument is supplied, in which case the new columns will be created.
 
-The function can accept an iterator or generator of rows and will commit them according to the batch size. The default batch size is 100, but you can specify a different size using the ``batch_size`` parameter:
+The function can accept an iterator or generator of rows. By default the entire insert - including table creation, any columns added by ``alter=True``, any ``truncate=True`` delete and every batch of rows - runs in a single transaction, so if an error occurs part-way through none of the changes are kept. To commit every N records instead, pass an explicit ``batch_size`` parameter:
 
 .. code-block:: python
 
@@ -1100,6 +1100,8 @@ The function can accept an iterator or generator of rows and will commit them ac
         "id": 1,
         "name": "Name {}".format(i),
     } for i in range(10000)), batch_size=1000)
+
+With an explicit ``batch_size`` each batch of that many records is committed separately, which makes the rows inserted so far visible to other connections while the insert is still running. The batch size defaults to 100 in that case.
 
 You can skip inserting any records that have a primary key that already exists using ``ignore=True``. This works with both ``.insert({...}, ignore=True)`` and ``.insert_all([...], ignore=True)``.
 

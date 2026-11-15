@@ -4697,7 +4697,17 @@ class Table(Queryable):
         that it creates (if table does not exist) has columns for ALL of that data.
 
         Use ``analyze=True`` to run ``ANALYZE`` after the insert has completed.
+
+        By default the whole operation - truncating, table creation, column
+        additions and every batch of rows - runs in a single transaction, so
+        a failure part-way through rolls everything back. Pass an explicit
+        ``batch_size=`` to get streaming behavior instead, where each batch
+        of that many records is committed separately.
         """
+        # An explicit batch_size= means the caller wants each batch to
+        # commit separately (streaming). Otherwise the entire insert is
+        # wrapped in one transaction below.
+        explicit_batch_size = not isinstance(batch_size, Default)
         pk = self.value_or_default("pk", pk)
         foreign_keys = self.value_or_default("foreign_keys", foreign_keys)
         column_order = self.value_or_default("column_order", column_order)
@@ -4820,89 +4830,103 @@ class Table(Queryable):
         )
         self.last_rowid = None
         self.last_pk = None
-        if truncate and self.exists():
-            with self.db.atomic():
-                self.db.execute(f"DELETE FROM {quote_identifier(self.name)};")
-        result = None
-        for chunk in chunks(itertools.chain([first_record], records_iter), batch_size):
-            chunk = list(chunk)
-            num_records_processed += len(chunk)
-            if first:
-                if not self.exists():
-                    # Use the first batch to derive the table names
-                    if list_mode:
-                        # Convert list records to dicts for type detection
-                        chunk_as_dicts = [dict(zip(column_names, row)) for row in chunk]
-                        column_types = suggest_column_types(chunk_as_dicts)
-                    else:
-                        dict_chunk = cast(list[dict[str, Any]], chunk)
-                        column_types = suggest_column_types(dict_chunk)
-                    if extracts:
-                        for col in extracts:
-                            if col in column_types:
-                                column_types[col] = (
-                                    int  # This will be an integer foreign key
-                                )
-                    column_types.update(columns or {})
-                    self.create(
-                        column_types,
-                        pk,
-                        foreign_keys,
-                        column_order=column_order,
-                        not_null=not_null,
-                        defaults=defaults,
-                        hash_id=hash_id,
-                        hash_id_columns=hash_id_columns,
-                        extracts=extracts,
-                        strict=strict,
-                    )
-                if list_mode:
-                    # In list mode, columns are already known
-                    all_columns = list(column_names)
-                    if hash_id:
-                        all_columns.insert(0, hash_id)
-                else:
-                    all_columns_set: set[str] = set()
-                    for record in cast(list[dict[str, Any]], chunk):
-                        all_columns_set.update(record.keys())
-                    all_columns = sorted(all_columns_set)
-                    if hash_id:
-                        all_columns.insert(0, hash_id)
-                if deferred_invalid_pk_check is not None:
-                    # alter=True - pk columns the table lacks are valid if
-                    # the records supply them, otherwise raise the error
-                    missing_pk_cols, invalid_pk_error = deferred_invalid_pk_check
-                    record_columns = {column: True for column in all_columns}
-                    if any(
-                        resolve_casing(col, record_columns) not in record_columns
-                        for col in missing_pk_cols
-                    ):
-                        raise invalid_pk_error
-            else:
-                if not list_mode:
-                    for record in cast(list[dict[str, Any]], chunk):
-                        all_columns += [
-                            column for column in record if column not in all_columns
-                        ]
-
-            first = False
-
-            result = self.insert_chunk(
-                alter,
-                extracts,
-                chunk,
-                all_columns,
-                hash_id,
-                hash_id_columns,
-                upsert,
-                pk,
-                not_null,
-                conversions,
-                num_records_processed,
-                replace,
-                ignore,
-                list_mode,
+        # An explicit batch_size keeps the streaming behavior where each
+        # batch commits separately. Otherwise truncate, table creation,
+        # column additions and all batches run in a single transaction.
+        if explicit_batch_size:
+            transaction: contextlib.AbstractContextManager[Any] = (
+                contextlib.nullcontext()
             )
+        else:
+            transaction = self.db.atomic()
+        result = None
+        with transaction:
+            if truncate and self.exists():
+                with self.db.atomic():
+                    self.db.execute(f"DELETE FROM {quote_identifier(self.name)};")
+            for chunk in chunks(
+                itertools.chain([first_record], records_iter), batch_size
+            ):
+                chunk = list(chunk)
+                num_records_processed += len(chunk)
+                if first:
+                    if not self.exists():
+                        # Use the first batch to derive the table names
+                        if list_mode:
+                            # Convert list records to dicts for type detection
+                            chunk_as_dicts = [
+                                dict(zip(column_names, row)) for row in chunk
+                            ]
+                            column_types = suggest_column_types(chunk_as_dicts)
+                        else:
+                            dict_chunk = cast(list[dict[str, Any]], chunk)
+                            column_types = suggest_column_types(dict_chunk)
+                        if extracts:
+                            for col in extracts:
+                                if col in column_types:
+                                    column_types[col] = (
+                                        int  # This will be an integer foreign key
+                                    )
+                        column_types.update(columns or {})
+                        self.create(
+                            column_types,
+                            pk,
+                            foreign_keys,
+                            column_order=column_order,
+                            not_null=not_null,
+                            defaults=defaults,
+                            hash_id=hash_id,
+                            hash_id_columns=hash_id_columns,
+                            extracts=extracts,
+                            strict=strict,
+                        )
+                    if list_mode:
+                        # In list mode, columns are already known
+                        all_columns = list(column_names)
+                        if hash_id:
+                            all_columns.insert(0, hash_id)
+                    else:
+                        all_columns_set: set[str] = set()
+                        for record in cast(list[dict[str, Any]], chunk):
+                            all_columns_set.update(record.keys())
+                        all_columns = sorted(all_columns_set)
+                        if hash_id:
+                            all_columns.insert(0, hash_id)
+                    if deferred_invalid_pk_check is not None:
+                        # alter=True - pk columns the table lacks are valid if
+                        # the records supply them, otherwise raise the error
+                        missing_pk_cols, invalid_pk_error = deferred_invalid_pk_check
+                        record_columns = {column: True for column in all_columns}
+                        if any(
+                            resolve_casing(col, record_columns) not in record_columns
+                            for col in missing_pk_cols
+                        ):
+                            raise invalid_pk_error
+                else:
+                    if not list_mode:
+                        for record in cast(list[dict[str, Any]], chunk):
+                            all_columns += [
+                                column for column in record if column not in all_columns
+                            ]
+
+                first = False
+
+                result = self.insert_chunk(
+                    alter,
+                    extracts,
+                    chunk,
+                    all_columns,
+                    hash_id,
+                    hash_id_columns,
+                    upsert,
+                    pk,
+                    not_null,
+                    conversions,
+                    num_records_processed,
+                    replace,
+                    ignore,
+                    list_mode,
+                )
 
         # If we only handled a single row populate self.last_pk
         if num_records_processed == 1:

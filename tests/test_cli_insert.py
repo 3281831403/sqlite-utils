@@ -892,3 +892,165 @@ def test_insert_code_file_not_found(tmpdir):
     )
     assert result.exit_code == 1
     assert "File not found: missing.py" in result.output
+
+
+def _ndjson_rows(count, bad_index=None):
+    rows = [{"id": i, "v": i * 2} for i in range(1, count + 1)]
+    if bad_index is not None:
+        rows[bad_index] = {"id": 1, "v": -1}  # duplicates pk of first row
+    return "\n".join(json.dumps(r) for r in rows)
+
+
+def test_insert_atomic_by_default(db_path):
+    # A constraint violation on record 150 must roll back everything,
+    # including the CREATE TABLE and the first 100 records
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--nl", "--pk", "id"],
+        input=_ndjson_rows(159, bad_index=149),
+    )
+    assert result.exit_code != 0
+    db = Database(db_path)
+    assert "t" not in db.table_names()
+
+
+def test_insert_atomic_existing_table(db_path):
+    db = Database(db_path)
+    db["t"].insert({"id": 999, "v": 999}, pk="id")
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--nl", "--pk", "id"],
+        input=_ndjson_rows(159, bad_index=149),
+    )
+    assert result.exit_code != 0
+    assert list(db["t"].rows) == [{"id": 999, "v": 999}]
+
+
+def test_insert_atomic_truncate_rollback(db_path):
+    db = Database(db_path)
+    db["t"].insert_all([{"id": i, "v": "old"} for i in range(1, 6)], pk="id")
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--nl", "--pk", "id", "--truncate"],
+        input=_ndjson_rows(159, bad_index=149),
+    )
+    assert result.exit_code != 0
+    # The --truncate delete must have been rolled back too
+    assert db["t"].count == 5
+    assert all(r["v"] == "old" for r in db["t"].rows)
+
+
+def test_insert_explicit_batch_size_still_streams(db_path):
+    # Explicit --batch-size keeps the per-batch commit behavior
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--nl", "--pk", "id", "--batch-size", "100"],
+        input=_ndjson_rows(159, bad_index=149),
+    )
+    assert result.exit_code != 0
+    db = Database(db_path)
+    assert db["t"].count == 100
+
+
+def test_upsert_atomic_by_default(db_path):
+    rows = [{"id": i, "v": i} for i in range(1, 160)]
+    rows[149] = {"v": "missing pk"}  # upsert requires a pk value
+    result = CliRunner().invoke(
+        cli.cli,
+        ["upsert", db_path, "t", "-", "--nl", "--pk", "id"],
+        input="\n".join(json.dumps(r) for r in rows),
+    )
+    assert result.exit_code != 0
+    db = Database(db_path)
+    assert "t" not in db.table_names()
+
+
+def _csv(rows, headers):
+    lines = [",".join(headers)]
+    lines += [",".join(str(row[h]) for h in headers) for row in rows]
+    return "\n".join(lines)
+
+
+def test_insert_alter_new_columns_get_detected_types(db_path):
+    # Incremental --alter import must produce the same column types as a
+    # one-shot import of the same data
+    one_shot = str(db_path) + ".one-shot.db"
+    rows = [{"id": i, "amount": i * 7} for i in range(1, 21)]
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", one_shot, "t", "-", "--csv", "--pk", "id"],
+        input=_csv(rows, ["id", "amount"]),
+    )
+    assert result.exit_code == 0
+    # Incremental: first import without "amount", then add it with --alter
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--csv", "--pk", "id"],
+        input=_csv([{"id": i} for i in range(1, 21)], ["id"]),
+    )
+    assert result.exit_code == 0
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--csv", "--pk", "id", "--alter"],
+        input=_csv(
+            [{"id": i, "amount": i * 7} for i in range(21, 41)], ["id", "amount"]
+        ),
+    )
+    assert result.exit_code == 0
+    expected = {c.name: c.type for c in Database(one_shot)["t"].columns}
+    actual = {c.name: c.type for c in Database(db_path)["t"].columns}
+    assert actual == expected
+    assert actual["amount"].upper() == "INTEGER"
+
+
+def test_insert_alter_type_option_applies_to_new_columns(db_path):
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--csv", "--pk", "id"],
+        input=_csv([{"id": i} for i in range(1, 21)], ["id"]),
+    )
+    assert result.exit_code == 0
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "insert",
+            db_path,
+            "t",
+            "-",
+            "--csv",
+            "--pk",
+            "id",
+            "--alter",
+            "--type",
+            "amount",
+            "float",
+        ],
+        input=_csv(
+            [{"id": i, "amount": i * 7} for i in range(21, 41)], ["id", "amount"]
+        ),
+    )
+    assert result.exit_code == 0
+    types = {c.name: c.type.upper() for c in Database(db_path)["t"].columns}
+    assert types["amount"] == "FLOAT"
+
+
+def test_insert_alter_does_not_retype_existing_columns(db_path):
+    # Existing TEXT columns (e.g. zip codes with leading zeros) must not
+    # be rewritten when --alter adds new columns
+    db = Database(db_path)
+    db["t"].create({"id": int, "zipcode": str}, pk="id")
+    db["t"].insert_all([{"id": i, "zipcode": f"0123{i % 10}"} for i in range(1, 21)])
+    result = CliRunner().invoke(
+        cli.cli,
+        ["insert", db_path, "t", "-", "--csv", "--pk", "id", "--alter"],
+        input=_csv(
+            [{"id": i, "amount": i * 7} for i in range(21, 41)], ["id", "amount"]
+        ),
+    )
+    assert result.exit_code == 0
+    types = {c.name: c.type.upper() for c in db["t"].columns}
+    assert types["zipcode"] == "TEXT"
+    # New column still got its detected type
+    assert types["amount"] == "INTEGER"
+    row = db["t"].get(1)
+    assert row["zipcode"] == "01231"

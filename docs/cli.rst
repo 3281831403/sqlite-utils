@@ -1153,6 +1153,8 @@ To specify a column as the primary key, use ``--pk=column_name``.
 
 To create a compound primary key across more than one column, use ``--pk`` multiple times.
 
+By default the whole import runs in a single transaction: if any record fails - for example because it violates a constraint - everything is rolled back, including any rows already inserted, the ``CREATE TABLE`` statement, columns added by ``--alter``, rows deleted by ``--truncate`` and any lookup tables populated by extracts. Pass ``--batch-size N`` to commit every N records instead, which makes each batch visible to other connections as soon as it is inserted.
+
 If you feed it a JSON list it will insert multiple records. For example, if ``dogs.json`` looks like this:
 
 .. code-block:: json
@@ -1399,7 +1401,9 @@ The column type should be one of ``TEXT``, ``INTEGER``, ``FLOAT``, ``REAL``, ``B
     sqlite-utils insert events.db events events.csv --csv --strict \
         --type payload any
 
-As with detected column types, ``--type`` only affects tables created by the command. If the table already exists, its existing column types are left unchanged.
+As with detected column types, ``--type`` only affects tables created by the command, plus any columns added to an existing table by ``--alter``. Columns that already existed are never re-typed, so existing ``TEXT`` values such as ZIP codes with leading zeros are preserved.
+
+When ``--alter`` adds new columns to an existing table, those columns get the same types they would have received in a one-shot import: automatically detected types for CSV/TSV data, or the types requested with ``--type``.
 
 To disable type detection and treat all columns as TEXT, use ``--no-detect-types``:
 

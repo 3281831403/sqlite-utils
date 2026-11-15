@@ -1739,3 +1739,61 @@ def test_chained_create_sets_pks(fresh_db):
         {"id": int, "name": str, "color": str}
     )
     assert table.pks == ["id"]
+
+
+def test_insert_all_atomic_rolls_back_everything(fresh_db):
+    # A failure part-way through must roll back the rows inserted so far
+    # and the CREATE TABLE statement
+    records = [{"id": i, "v": i} for i in range(1, 160)]
+    records[149] = {"id": 1, "v": -1}  # duplicates pk of first record
+    with pytest.raises(Exception):
+        fresh_db["t"].insert_all(records, pk="id")
+    assert "t" not in fresh_db.table_names()
+
+
+def test_insert_all_atomic_existing_table_and_alter(fresh_db):
+    # Rows, and columns added by alter=True, roll back together
+    fresh_db["t"].insert({"id": 1, "a": 1}, pk="id")
+    records = [{"id": i + 1, "a": i, "newcol": i} for i in range(1, 160)]
+    records[149] = {"id": 1, "a": -1, "newcol": -1}  # duplicates existing pk
+    with pytest.raises(Exception):
+        fresh_db["t"].insert_all(records, pk="id", alter=True)
+    assert [c.name for c in fresh_db["t"].columns] == ["id", "a"]
+    assert list(fresh_db["t"].rows) == [{"id": 1, "a": 1}]
+
+
+def test_insert_all_atomic_truncate_rolls_back(fresh_db):
+    fresh_db["t"].insert_all([{"id": i, "v": "old"} for i in range(1, 6)], pk="id")
+    records = [{"id": i, "v": i} for i in range(1, 160)]
+    records[149] = {"id": 1, "v": -1}
+    with pytest.raises(Exception):
+        fresh_db["t"].insert_all(records, pk="id", truncate=True)
+    assert fresh_db["t"].count == 5
+    assert all(r["v"] == "old" for r in fresh_db["t"].rows)
+
+
+def test_insert_all_atomic_extracts_roll_back(fresh_db):
+    records = [{"id": i, "species": "oak" if i % 2 else "pine"} for i in range(1, 160)]
+    records[149] = {"id": 1, "species": "birch"}  # duplicates pk of first record
+    with pytest.raises(Exception):
+        fresh_db["trees"].insert_all(records, pk="id", extracts={"species": "Species"})
+    assert "trees" not in fresh_db.table_names()
+    assert "Species" not in fresh_db.table_names()
+
+
+def test_insert_all_explicit_batch_size_commits_each_batch(fresh_db):
+    # Explicit batch_size= keeps the streaming behavior: each batch commits
+    records = [{"id": i, "v": i} for i in range(1, 160)]
+    records[149] = {"id": 1, "v": -1}
+    with pytest.raises(Exception):
+        fresh_db["t"].insert_all(records, pk="id", batch_size=100)
+    assert fresh_db["t"].count == 100
+
+
+def test_insert_all_atomic_inside_outer_transaction(fresh_db):
+    # A caller-managed transaction is respected: rollback is theirs to decide
+    with pytest.raises(Exception):
+        with fresh_db.atomic():
+            fresh_db["t"].insert_all([{"id": 1, "v": 1}], pk="id")
+            raise RuntimeError("caller aborts")
+    assert "t" not in fresh_db.table_names()
